@@ -11,8 +11,8 @@ android {
         applicationId = "com.forcequit.app"
         minSdk = 29
         targetSdk = 37
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     // Release signing credentials live in ~/.gradle/gradle.properties, never in this repo.
@@ -30,6 +30,10 @@ android {
 
     buildTypes {
         release {
+            // Strips unused library code/resources (Compose is most of the APK's size).
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
             if (keystorePath != null) signingConfig = signingConfigs.getByName("release")
         }
     }
