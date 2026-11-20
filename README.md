@@ -9,13 +9,13 @@ ForceQuit lists the apps on your phone that are running, meaning they haven't be
 - **One-tap force quit** for every running app that isn't whitelisted, with a progress overlay and a Cancel button.
 - **Whitelist** with search, so apps you rely on (messaging, music, etc.) are never touched.
 - **Rescan** shows what's running again and flags apps that **reopened** after being force-quit.
-- **Disable** preinstalled apps that keep coming back, and re-enable them later from the **Disabled** tab.
+- **Disable** preinstalled apps that keep coming back, and re-enable them later from the **Disabled** tab, which also lists apps disabled outside ForceQuit.
 - **Export / Import** your whitelist and disabled list as a small JSON file, to back them up or move them to another phone.
 - **Protected apps are never touched**: your home screen, keyboard, System UI, Settings and ForceQuit itself.
 
 ## Privacy
 
-ForceQuit has **no internet permission**. It cannot send anything anywhere. Its accessibility service only acts when you tap a button in the app, and it only reads the Settings app's screens so it can press the right buttons.
+ForceQuit has **no internet permission**. It cannot send anything anywhere. It can see which apps are installed, because it needs that to list them. Its accessibility service only acts when you tap a button in the app, and it only reads the Settings app's screens so it can press the right buttons.
 
 ## Install
 
@@ -36,6 +36,8 @@ The app shows a card with shortcuts to both screens until the service is on.
 ## How it works
 
 Modern Android doesn't let normal apps see which other apps are running. Instead, ForceQuit uses Android's *stopped* state: an app is in it after being force-stopped (or freshly installed) and leaves it as soon as it runs again. So **"running" here means "has had a chance to run since it was last force-stopped"**, which is exactly the set of apps a force quit can do something about.
+
+It lists the same apps as **Settings → Apps**: every app with an icon (even a hidden one), every app you installed, and every preinstalled app that has been updated, such as Google Play services. Left out are the protected apps, other preinstalled system services (unless you disabled them), parts of Android system modules such as Wireless Emergency Alerts (Settings has no Force stop button for them), and apps in a work profile or private space.
 
 For each app, it opens *App info*, waits for the page to show that app, presses **Force stop**, confirms the dialog, and checks with the package manager that the app is now actually stopped. Button labels are read from the phone's own Settings app, so it should work in any language.
 

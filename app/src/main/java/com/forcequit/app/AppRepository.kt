@@ -5,18 +5,28 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.Build
 import android.provider.Settings
 import org.json.JSONArray
 import org.json.JSONObject
+import java.text.Collator
 
 data class AppEntry(
     val packageName: String,
     val label: String,
     val isSystem: Boolean,
-    /** False when Android has the app in the "stopped" state, i.e. it hasn't run since its last force stop. */
+    /** False when the app is disabled (by ForceQuit, in Settings or any other way), so it can't run at all. */
+    val isEnabled: Boolean,
+    /**
+     * False when Android has the app in the "stopped" state, i.e. it hasn't run since its last force stop,
+     * and always false for a disabled app.
+     */
     val isActive: Boolean,
 ) {
-    /** Android only lets you disable preinstalled apps; apps you installed can only be uninstalled. */
+    /**
+     * Settings only has Disable and Enable buttons for preinstalled apps; apps you installed can only be
+     * uninstalled.
+     */
     val canDisable: Boolean get() = isSystem
 }
 
@@ -40,22 +50,6 @@ class AppRepository(private val context: Context) {
     fun rememberDisabled(packageName: String) = updateSet(KEY_DISABLED, packageName, true)
 
     fun forgetDisabled(packageName: String) = updateSet(KEY_DISABLED, packageName, false)
-
-    /**
-     * Apps ForceQuit has disabled and that are still disabled. Apps re-enabled some other way
-     * (or uninstalled) are dropped from the list.
-     */
-    fun disabledApps(): List<AppEntry> {
-        val remembered = prefs.getStringSet(KEY_DISABLED, emptySet())!!
-        val entries = remembered.mapNotNull { pkg ->
-            val info = appInfo(pkg)?.takeIf { !it.enabled } ?: return@mapNotNull null
-            AppEntry(pkg, info.loadLabel(pm).toString(), isSystem = true, isActive = false)
-        }
-        if (entries.size != remembered.size) {
-            prefs.edit().putStringSet(KEY_DISABLED, entries.map { it.packageName }.toSet()).apply()
-        }
-        return entries.sortedBy { it.label.lowercase() }
-    }
 
     /** The whitelist and the disabled-apps list as a JSON backup file. */
     fun exportSettings(): String = JSONObject()
@@ -91,23 +85,87 @@ class AppRepository(private val context: Context) {
         prefs.edit().putStringSet(key, updated).apply()
     }
 
-    /** Every app with a launcher icon, minus the protected ones. Sorted by name. */
+    /**
+     * The apps Settings → Apps lists (with "Show system" off): every app with a launcher icon, even a
+     * hidden one, every app you installed, and every preinstalled app that has been updated. Disabled apps
+     * are included with [AppEntry.isEnabled] false, and so is any preinstalled system service a user has
+     * disabled. Protected apps are left out, and so are apps Settings has no buttons for. Sorted by name.
+     *
+     * Also forgets apps ForceQuit disabled that have since been re-enabled some other way, or uninstalled.
+     */
     fun installedApps(): List<AppEntry> {
         val protected = protectedPackages()
-        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        return pm.queryIntentActivities(launcherIntent, 0)
-            .map { it.activityInfo.applicationInfo }
-            .distinctBy { it.packageName }
-            .filter { it.packageName !in protected && it.flags and ApplicationInfo.FLAG_PERSISTENT == 0 }
+        val remembered = prefs.getStringSet(KEY_DISABLED, emptySet())!!
+        // MATCH_DISABLED_COMPONENTS: without it, disabled apps and apps that hide their icon aren't returned.
+        val withIcon = pm.queryIntentActivities(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER),
+            PackageManager.MATCH_DISABLED_COMPONENTS,
+        ).mapTo(HashSet()) { it.activityInfo.packageName }
+
+        fun isListed(info: ApplicationInfo): Boolean {
+            if (info.packageName in protected || info.flags and ApplicationInfo.FLAG_PERSISTENT != 0) return false
+            if (isInSystemModule(info)) return false
+            // What Settings → Apps shows. Anything else preinstalled is a system service.
+            val inSettingsList = info.packageName in withIcon ||
+                info.flags and ApplicationInfo.FLAG_SYSTEM == 0 ||
+                info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP != 0
+            if (info.enabled) return inSettingsList
+            // Disabled apps are listed only if someone disabled them, not if they ship disabled (like the
+            // Linux Terminal, which has no Enable button in Settings).
+            if (info.packageName in remembered) return true
+            return when (enabledSetting(info.packageName)) {
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED_USER -> true // Settings, `pm disable-user`, debloat tools
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED -> inSettingsList // the phone maker, or a root tool
+                else -> false
+            }
+        }
+
+        val collator = Collator.getInstance() // sorts "Éclair" next to "Eclipse", not after "Zoom"
+        val apps = pm.getInstalledApplications(MATCH_FLAGS)
+            .filter(::isListed)
             .map { info ->
                 AppEntry(
                     packageName = info.packageName,
                     label = info.loadLabel(pm).toString(),
                     isSystem = info.flags and ApplicationInfo.FLAG_SYSTEM != 0,
-                    isActive = info.flags and ApplicationInfo.FLAG_STOPPED == 0,
+                    isEnabled = info.enabled,
+                    isActive = info.enabled && info.flags and ApplicationInfo.FLAG_STOPPED == 0,
                 )
             }
-            .sortedBy { it.label.lowercase() }
+            .sortedWith(compareBy(collator) { it.label })
+
+        val stillDisabled = remembered intersect apps.filter { !it.isEnabled }.mapTo(HashSet()) { it.packageName }
+        if (stillDisabled.size != remembered.size) prefs.edit().putStringSet(KEY_DISABLED, stillDisabled).apply()
+        return apps
+    }
+
+    /**
+     * Part of an Android system module, i.e. inside a module's APEX, like Wireless Emergency Alerts.
+     * Settings shows no Force stop, Disable or Enable button for these, so ForceQuit can't act on them.
+     */
+    private fun isInSystemModule(info: ApplicationInfo): Boolean {
+        if (info.sourceDir?.startsWith("/apex/") != true) return false
+        // Android 14 and older have no API to tell which APEX an app is in; Settings treats them all as modules.
+        if (Build.VERSION.SDK_INT < 35) return true
+        // Not every APEX is a module: Google Play services can live in one and still has a Force stop button.
+        val apex = try {
+            pm.getPackageInfo(info.packageName, 0).apexPackageName
+        } catch (e: PackageManager.NameNotFoundException) {
+            null
+        } ?: return false
+        return try {
+            pm.getModuleInfo(apex, 0)
+            true
+        } catch (e: PackageManager.NameNotFoundException) {
+            false
+        }
+    }
+
+    /** One of PackageManager.COMPONENT_ENABLED_STATE_*, or -1 if the app is gone. */
+    private fun enabledSetting(packageName: String): Int = try {
+        pm.getApplicationEnabledSetting(packageName)
+    } catch (e: IllegalArgumentException) {
+        -1
     }
 
     fun isStopped(packageName: String): Boolean =
@@ -119,7 +177,7 @@ class AppRepository(private val context: Context) {
 
     /** Also finds disabled apps. */
     fun appInfo(packageName: String): ApplicationInfo? = try {
-        pm.getApplicationInfo(packageName, PackageManager.MATCH_DISABLED_COMPONENTS)
+        pm.getApplicationInfo(packageName, MATCH_FLAGS)
     } catch (e: PackageManager.NameNotFoundException) {
         null
     }
@@ -143,6 +201,13 @@ class AppRepository(private val context: Context) {
 
     companion object {
         const val SETTINGS_PACKAGE = "com.android.settings"
+
+        /**
+         * Finds disabled apps too, and counts "disabled until used" apps as enabled: that's how Samsung puts
+         * unused apps into deep sleep, and they are ordinary apps that run again as soon as you open them.
+         */
+        private const val MATCH_FLAGS =
+            PackageManager.MATCH_DISABLED_COMPONENTS or PackageManager.MATCH_DISABLED_UNTIL_USED_COMPONENTS
         private const val KEY_WHITELIST = "whitelist"
         private const val KEY_DISABLED = "disabled_by_us"
     }

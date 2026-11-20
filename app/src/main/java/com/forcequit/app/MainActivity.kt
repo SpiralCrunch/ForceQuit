@@ -93,7 +93,6 @@ private fun ForceQuitScreen() {
     val runState by ForceStopController.state.collectAsState()
 
     var apps by remember { mutableStateOf<List<AppEntry>?>(null) }
-    var disabled by remember { mutableStateOf(emptyList<AppEntry>()) }
     var confirmDisable by remember { mutableStateOf<AppEntry?>(null) }
     var whitelist by remember { mutableStateOf(repo.whitelist()) }
     var serviceEnabled by remember { mutableStateOf(isServiceEnabled(context)) }
@@ -107,7 +106,6 @@ private fun ForceQuitScreen() {
         scope.launch {
             scanning = true
             val loaded = withContext(Dispatchers.IO) { repo.installedApps() }
-            disabled = withContext(Dispatchers.IO) { repo.disabledApps() }
             apps = loaded
             scanning = false
             onDone(loaded)
@@ -170,7 +168,10 @@ private fun ForceQuitScreen() {
         refresh()
     }
 
-    val toQuit = apps.orEmpty().filter { it.isActive && it.packageName !in whitelist }
+    val (enabledApps, disabled) = apps.orEmpty().partition { it.isEnabled }
+    val toQuit = enabledApps.filter { it.isActive && it.packageName !in whitelist }
+    // Count only whitelisted apps that are listed, not ones since uninstalled or disabled, or imported from another phone.
+    val whitelistedCount = enabledApps.count { it.packageName in whitelist }
     val busy = runState is RunState.Running
 
     fun run(packages: List<String>, action: Action) {
@@ -246,7 +247,7 @@ private fun ForceQuitScreen() {
 
             TabRow(selectedTabIndex = tab) {
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("To quit (${toQuit.size})") })
-                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Whitelist (${whitelist.size})") })
+                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Whitelist ($whitelistedCount)") })
                 Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Disabled (${disabled.size})") })
             }
 
@@ -259,7 +260,7 @@ private fun ForceQuitScreen() {
                     onKeep = { toggle(it, true) },
                     onDisable = { confirmDisable = it },
                 )
-                tab == 1 -> WhitelistEditor(apps!!, whitelist, ::toggle)
+                tab == 1 -> WhitelistEditor(enabledApps, whitelist, ::toggle)
                 else -> DisabledList(disabled, canAct = serviceEnabled && !busy) {
                     run(listOf(it.packageName), Action.ENABLE)
                 }
@@ -303,16 +304,19 @@ private fun DisabledList(disabled: List<AppEntry>, canAct: Boolean, onEnable: (A
     LazyColumn(Modifier.fillMaxSize()) {
         item {
             Text(
-                if (disabled.isEmpty()) "No apps disabled by ForceQuit."
-                else "Apps ForceQuit has disabled. They can't run until you enable them again.",
+                if (disabled.isEmpty()) "No disabled apps."
+                else "Disabled apps, whether ForceQuit or something else disabled them. They can't run until you enable them again.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(16.dp),
             )
         }
         items(disabled, key = { it.packageName }) { app ->
-            AppRow(app) {
-                OutlinedButton(onClick = { onEnable(app) }, enabled = canAct) { Text("Enable") }
+            // An app you installed can only have been disabled with adb or a tool like it; Settings has no Enable button for it.
+            AppRow(app, note = if (app.canDisable) null else "Can't be re-enabled from Settings") {
+                if (app.canDisable) {
+                    OutlinedButton(onClick = { onEnable(app) }, enabled = canAct) { Text("Enable") }
+                }
             }
         }
     }
@@ -321,7 +325,9 @@ private fun DisabledList(disabled: List<AppEntry>, canAct: Boolean, onEnable: (A
 @Composable
 private fun WhitelistEditor(apps: List<AppEntry>, whitelist: Set<String>, onToggle: (String, Boolean) -> Unit) {
     var query by remember { mutableStateOf("") }
-    val shown = apps.filter { query.isBlank() || it.label.contains(query, ignoreCase = true) }
+    val q = query.trim()
+    val shown = apps
+        .filter { it.label.contains(q, ignoreCase = true) || it.packageName.contains(q, ignoreCase = true) }
         .sortedByDescending { it.packageName in whitelist }
     Column(Modifier.fillMaxSize()) {
         OutlinedTextField(
