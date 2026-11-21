@@ -158,7 +158,8 @@ class ForceStopService : AccessibilityService() {
     }
 
     private fun AccessibilityNodeInfo.hasText(candidates: List<String>): Boolean {
-        val t = (text ?: contentDescription)?.toString()?.trim() ?: return false
+        // Cleaned like our own labels, so an app name padded with direction marks still matches its App info page.
+        val t = (text ?: contentDescription)?.let(::cleanLabel) ?: return false
         return candidates.any { t.equals(it, ignoreCase = true) }
     }
 

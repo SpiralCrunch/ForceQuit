@@ -11,6 +11,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.text.Collator
 
+/**
+ * A name without the invisible text-direction marks some apps pad it with. Google's Android Developer
+ * Verifier has over a hundred, which push its name off to one side and get it cut short.
+ */
+fun cleanLabel(label: CharSequence): String = label.toString().trim { it.isWhitespace() || it in DIRECTION_MARKS }
+
+private const val DIRECTION_MARKS = "\u200E\u200F\u061C\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069"
+
 data class AppEntry(
     val packageName: String,
     val label: String,
@@ -22,6 +30,11 @@ data class AppEntry(
      * and always false for a disabled app.
      */
     val isActive: Boolean,
+    /**
+     * Shows an icon in the app drawer. Apps without one are background services (system services, phone
+     * maker and Google components, plugins): they're listed under Services, and Force quit leaves them alone.
+     */
+    val hasIcon: Boolean,
 ) {
     /**
      * Settings only has Disable and Enable buttons for preinstalled apps; apps you installed can only be
@@ -96,11 +109,13 @@ class AppRepository(private val context: Context) {
     fun installedApps(): List<AppEntry> {
         val protected = protectedPackages()
         val remembered = prefs.getStringSet(KEY_DISABLED, emptySet())!!
+        val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         // MATCH_DISABLED_COMPONENTS: without it, disabled apps and apps that hide their icon aren't returned.
-        val withIcon = pm.queryIntentActivities(
-            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER),
-            PackageManager.MATCH_DISABLED_COMPONENTS,
-        ).mapTo(HashSet()) { it.activityInfo.packageName }
+        val withIcon = pm.queryIntentActivities(launcherIntent, PackageManager.MATCH_DISABLED_COMPONENTS)
+            .mapTo(HashSet()) { it.activityInfo.packageName }
+        // Just the icons the app drawer actually shows, including deep-sleeping apps'.
+        val withVisibleIcon = pm.queryIntentActivities(launcherIntent, PackageManager.MATCH_DISABLED_UNTIL_USED_COMPONENTS)
+            .mapTo(HashSet()) { it.activityInfo.packageName }
 
         fun isListed(info: ApplicationInfo): Boolean {
             if (info.packageName in protected || info.flags and ApplicationInfo.FLAG_PERSISTENT != 0) return false
@@ -126,10 +141,11 @@ class AppRepository(private val context: Context) {
             .map { info ->
                 AppEntry(
                     packageName = info.packageName,
-                    label = info.loadLabel(pm).toString(),
+                    label = cleanLabel(info.loadLabel(pm)),
                     isSystem = info.flags and ApplicationInfo.FLAG_SYSTEM != 0,
                     isEnabled = info.enabled,
                     isActive = info.enabled && info.flags and ApplicationInfo.FLAG_STOPPED == 0,
+                    hasIcon = info.packageName in withVisibleIcon,
                 )
             }
             .sortedWith(compareBy(collator) { it.label })
@@ -173,7 +189,7 @@ class AppRepository(private val context: Context) {
 
     fun isEnabled(packageName: String): Boolean = appInfo(packageName)?.enabled ?: false
 
-    fun label(packageName: String): String = appInfo(packageName)?.loadLabel(pm)?.toString() ?: packageName
+    fun label(packageName: String): String = appInfo(packageName)?.loadLabel(pm)?.let(::cleanLabel) ?: packageName
 
     /** Also finds disabled apps. */
     fun appInfo(packageName: String): ApplicationInfo? = try {

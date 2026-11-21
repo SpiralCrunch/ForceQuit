@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
@@ -31,12 +32,15 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -63,7 +67,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.graphics.drawable.toBitmap
@@ -97,8 +103,9 @@ private fun ForceQuitScreen() {
     var whitelist by remember { mutableStateOf(repo.whitelist()) }
     var serviceEnabled by remember { mutableStateOf(isServiceEnabled(context)) }
     var tab by remember { mutableIntStateOf(0) }
+    var query by remember { mutableStateOf("") }
     var scanning by remember { mutableStateOf(false) }
-    // Apps the last run force stopped, so a rescan can flag any that started up again.
+    // Apps force stopped since ForceQuit was opened, so a rescan can flag any that started up again.
     var lastStopped by remember { mutableStateOf(emptySet<String>()) }
 
     fun refresh(onDone: (List<AppEntry>) -> Unit = {}) {
@@ -113,7 +120,7 @@ private fun ForceQuitScreen() {
     }
 
     fun rescan() = refresh { loaded ->
-        val running = loaded.filter { it.isActive && it.packageName !in whitelist }
+        val running = loaded.toQuit(whitelist)
         val reopened = running.count { it.packageName in lastStopped }
         val message = when {
             running.isEmpty() -> "Rescanned: nothing running"
@@ -163,38 +170,75 @@ private fun ForceQuitScreen() {
     LaunchedEffect(runState) {
         val finished = runState as? RunState.Finished ?: return@LaunchedEffect
         if (finished.action == Action.FORCE_STOP) {
-            lastStopped = finished.results.filter { it.outcome.succeeded }.map { it.packageName }.toSet()
+            // Added to, not replaced, so stopping one service doesn't clear the notes from the last Force quit.
+            lastStopped = lastStopped + finished.results.filter { it.outcome.succeeded }.map { it.packageName }
         }
         refresh()
     }
 
     val (enabledApps, disabled) = apps.orEmpty().partition { it.isEnabled }
-    val toQuit = enabledApps.filter { it.isActive && it.packageName !in whitelist }
+    val (appsWithIcon, services) = enabledApps.partition { it.hasIcon }
+    val toQuit = apps.orEmpty().toQuit(whitelist)
     // Count only whitelisted apps that are listed, not ones since uninstalled or disabled, or imported from another phone.
-    val whitelistedCount = enabledApps.count { it.packageName in whitelist }
+    val whitelistedCount = appsWithIcon.count { it.packageName in whitelist }
     val busy = runState is RunState.Running
+
+    // One search for every tab. Each list, and the Force quit button, only ever covers the apps it shows.
+    val q = query.trim()
+    val searching = q.isNotEmpty()
+    fun List<AppEntry>.matching() =
+        if (!searching) this
+        else filter { it.label.contains(q, ignoreCase = true) || it.packageName.contains(q, ignoreCase = true) }
+    val shownToQuit = toQuit.matching()
+    val shownWhitelist = appsWithIcon.matching().sortedByDescending { it.packageName in whitelist }
+    val shownServices = services.matching()
+    val shownDisabled = disabled.matching()
 
     fun run(packages: List<String>, action: Action) {
         if (!ForceStopController.start(packages, action)) refresh()
     }
 
     confirmDisable?.let { app ->
+        // A service has no icon to lose, but other apps and phone features may quietly depend on it.
+        val service = !app.hasIcon
+        val warningIcon: (@Composable () -> Unit)? =
+            if (service) ({ Text("⚠", style = MaterialTheme.typography.headlineMedium) }) else null
         AlertDialog(
             onDismissRequest = { confirmDisable = null },
+            icon = warningIcon,
             title = { Text("Disable ${app.label}?") },
             text = {
                 Text(
-                    "It will be stopped and won't be able to run again, and its icon will disappear, " +
-                        "until you turn it back on from the Disabled tab."
+                    if (service) {
+                        "This is a background service, not an app you open. Other apps and phone features may " +
+                            "rely on it and can stop working without any warning. Only disable it if you know " +
+                            "what it does. You can turn it back on from the Disabled tab."
+                    } else {
+                        "It will be stopped and won't be able to run again, and its icon will disappear, " +
+                            "until you turn it back on from the Disabled tab."
+                    }
                 )
             },
             confirmButton = {
                 TextButton(onClick = {
                     confirmDisable = null
                     run(listOf(app.packageName), Action.DISABLE)
-                }) { Text("Disable") }
+                }) {
+                    if (service) Text("Disable anyway", color = MaterialTheme.colorScheme.error) else Text("Disable")
+                }
             },
-            dismissButton = { TextButton(onClick = { confirmDisable = null }) { Text("Cancel") } },
+            dismissButton = {
+                Row {
+                    // The warning says to disable it only if you know what it does, so offer to find out.
+                    if (service) {
+                        TextButton(onClick = {
+                            confirmDisable = null
+                            lookUp(context, app)
+                        }) { Text("Look it up") }
+                    }
+                    TextButton(onClick = { confirmDisable = null }) { Text("Cancel") }
+                }
+            },
         )
     }
 
@@ -217,13 +261,13 @@ private fun ForceQuitScreen() {
                         Text(if (scanning) "Scanning…" else "Rescan", style = MaterialTheme.typography.titleMedium)
                     }
                     Button(
-                        onClick = { run(toQuit.map { it.packageName }, Action.FORCE_STOP) },
-                        enabled = serviceEnabled && toQuit.isNotEmpty() && !busy,
+                        onClick = { run(shownToQuit.map { it.packageName }, Action.FORCE_STOP) },
+                        enabled = serviceEnabled && shownToQuit.isNotEmpty() && !busy,
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
                         modifier = Modifier.weight(1f).fillMaxHeight(),
                     ) {
                         Text(
-                            if (toQuit.isEmpty()) "Nothing to quit" else "Force quit ${toQuit.size}",
+                            if (shownToQuit.isEmpty()) "Nothing to quit" else "Force quit ${shownToQuit.size}",
                             style = MaterialTheme.typography.titleMedium,
                         )
                     }
@@ -245,23 +289,58 @@ private fun ForceQuitScreen() {
             if (!serviceEnabled) SetupCard()
             (runState as? RunState.Finished)?.let { ResultsCard(it) }
 
+            val focusManager = LocalFocusManager.current
+            val clearSearch: (@Composable () -> Unit)? =
+                if (query.isNotEmpty()) ({ IconButton(onClick = { query = "" }) { Text("✕") } }) else null
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                label = { Text("Search apps") },
+                singleLine = true,
+                trailingIcon = clearSearch,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { focusManager.clearFocus() }),
+                modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
+            )
+
+            // Four "Name (count)" labels don't fit across a phone, so each tab shows its count under its name.
+            // While searching, each count is how many apps in that tab match, so you can see where an app is.
             TabRow(selectedTabIndex = tab) {
-                Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("To quit (${toQuit.size})") })
-                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("Whitelist ($whitelistedCount)") })
-                Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("Disabled (${disabled.size})") })
+                listOf(
+                    "To quit" to shownToQuit.size,
+                    "Whitelist" to if (searching) shownWhitelist.size else whitelistedCount,
+                    "Services" to if (searching) shownServices.size else services.count { it.isActive },
+                    "Disabled" to shownDisabled.size,
+                ).forEachIndexed { i, (label, count) ->
+                    Tab(selected = tab == i, onClick = { tab = i }) {
+                        Column(Modifier.padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(label, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text("$count", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
             }
 
             when {
                 apps == null -> Box(Modifier.fillMaxSize(), Alignment.Center) { Text("Loading…") }
                 tab == 0 -> RunningList(
-                    toQuit,
+                    shownToQuit,
                     lastStopped,
+                    searching,
                     canAct = serviceEnabled && !busy,
                     onKeep = { toggle(it, true) },
                     onDisable = { confirmDisable = it },
                 )
-                tab == 1 -> WhitelistEditor(enabledApps, whitelist, ::toggle)
-                else -> DisabledList(disabled, canAct = serviceEnabled && !busy) {
+                tab == 1 -> WhitelistEditor(shownWhitelist, whitelist, searching, ::toggle)
+                tab == 2 -> ServicesList(
+                    shownServices,
+                    lastStopped,
+                    searching,
+                    canAct = serviceEnabled && !busy,
+                    onForceStop = { run(listOf(it.packageName), Action.FORCE_STOP) },
+                    onDisable = { confirmDisable = it },
+                )
+                else -> DisabledList(shownDisabled, searching, canAct = serviceEnabled && !busy) {
                     run(listOf(it.packageName), Action.ENABLE)
                 }
             }
@@ -273,6 +352,7 @@ private fun ForceQuitScreen() {
 private fun RunningList(
     toQuit: List<AppEntry>,
     lastStopped: Set<String>,
+    searching: Boolean,
     canAct: Boolean,
     onKeep: (String) -> Unit,
     onDisable: (AppEntry) -> Unit,
@@ -280,13 +360,15 @@ private fun RunningList(
     LazyColumn(Modifier.fillMaxSize()) {
         item {
             Text(
-                "Running apps that aren't whitelisted. Switch on \"Keep\" to move one to the whitelist. " +
-                    "Preinstalled apps that keep coming back can be disabled.",
+                "Running apps that aren't whitelisted. Switch on \"Keep\" to move one to the whitelist, or tap its " +
+                    "name to look it up. Preinstalled apps that keep coming back can be disabled. Apps with no " +
+                    "icon are under Services.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(16.dp),
             )
         }
+        if (searching && toQuit.isEmpty()) item { NoMatches() }
         items(toQuit, key = { it.packageName }) { app ->
             val note = if (app.packageName in lastStopped) "Reopened after force quit" else null
             AppRow(app, note = note) {
@@ -299,18 +381,77 @@ private fun RunningList(
     }
 }
 
+/** Running apps Force quit stops: ones with an app icon that aren't whitelisted. */
+private fun List<AppEntry>.toQuit(whitelist: Set<String>) =
+    filter { it.hasIcon && it.isActive && it.packageName !in whitelist }
+
+/** Apps with no app icon. Force quit leaves them alone, but each can be stopped or disabled on its own. */
 @Composable
-private fun DisabledList(disabled: List<AppEntry>, canAct: Boolean, onEnable: (AppEntry) -> Unit) {
+private fun ServicesList(
+    services: List<AppEntry>,
+    lastStopped: Set<String>,
+    searching: Boolean,
+    canAct: Boolean,
+    onForceStop: (AppEntry) -> Unit,
+    onDisable: (AppEntry) -> Unit,
+) {
     LazyColumn(Modifier.fillMaxSize()) {
         item {
             Text(
-                if (disabled.isEmpty()) "No disabled apps."
+                "Apps with no app icon: system services, Google and phone maker components, and plugins. " +
+                    "Force quit leaves these alone. You can stop one here, or disable a preinstalled one, " +
+                    "but other apps or phone features may rely on it. Tap a name to look it up first.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(16.dp),
+            )
+        }
+        if (searching && services.isEmpty()) item { NoMatches() }
+        // Kept in name order, running or not, so a service you stop stays where it was and shows "Not running".
+        items(services, key = { it.packageName }) { app ->
+            val note = if (app.isActive && app.packageName in lastStopped) "Reopened after force quit" else null
+            AppRow(app, note = note) {
+                if (app.canDisable) {
+                    TextButton(onClick = { onDisable(app) }, enabled = canAct) { Text("Disable") }
+                }
+                if (app.isActive) {
+                    TextButton(onClick = { onForceStop(app) }, enabled = canAct) { Text("Force stop") }
+                } else {
+                    Text(
+                        "Not running",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 12.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** Shown in a tab where the search matches nothing; the tab counts show where the matches are. */
+@Composable
+private fun NoMatches() {
+    Text(
+        "No apps in this tab match your search.",
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+    )
+}
+
+@Composable
+private fun DisabledList(disabled: List<AppEntry>, searching: Boolean, canAct: Boolean, onEnable: (AppEntry) -> Unit) {
+    LazyColumn(Modifier.fillMaxSize()) {
+        item {
+            Text(
+                if (disabled.isEmpty() && !searching) "No disabled apps."
                 else "Disabled apps, whether ForceQuit or something else disabled them. They can't run until you enable them again.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(16.dp),
             )
         }
+        if (searching && disabled.isEmpty()) item { NoMatches() }
         items(disabled, key = { it.packageName }) { app ->
             // An app you installed can only have been disabled with adb or a tool like it; Settings has no Enable button for it.
             AppRow(app, note = if (app.canDisable) null else "Can't be re-enabled from Settings") {
@@ -322,61 +463,78 @@ private fun DisabledList(disabled: List<AppEntry>, canAct: Boolean, onEnable: (A
     }
 }
 
+/** Every app with an icon, whitelisted ones first. The search box above the tabs filters it. */
 @Composable
-private fun WhitelistEditor(apps: List<AppEntry>, whitelist: Set<String>, onToggle: (String, Boolean) -> Unit) {
-    var query by remember { mutableStateOf("") }
-    val q = query.trim()
-    val shown = apps
-        .filter { it.label.contains(q, ignoreCase = true) || it.packageName.contains(q, ignoreCase = true) }
-        .sortedByDescending { it.packageName in whitelist }
-    Column(Modifier.fillMaxSize()) {
-        OutlinedTextField(
-            value = query,
-            onValueChange = { query = it },
-            label = { Text("Search apps") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-        )
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(shown, key = { it.packageName }) { app ->
-                val checked = app.packageName in whitelist
-                AppRow(app, onClick = { onToggle(app.packageName, !checked) }) {
-                    Checkbox(checked = checked, onCheckedChange = { onToggle(app.packageName, it) })
-                }
+private fun WhitelistEditor(apps: List<AppEntry>, whitelist: Set<String>, searching: Boolean, onToggle: (String, Boolean) -> Unit) {
+    LazyColumn(Modifier.fillMaxSize()) {
+        item {
+            Text(
+                "Every app with an icon. Tick the ones Force quit should never touch; they're listed first.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(16.dp),
+            )
+        }
+        if (searching && apps.isEmpty()) item { NoMatches() }
+        items(apps, key = { it.packageName }) { app ->
+            // Only the checkbox toggles: tapping the name looks the app up, as in the other tabs.
+            AppRow(app) {
+                Checkbox(checked = app.packageName in whitelist, onCheckedChange = { onToggle(app.packageName, it) })
             }
         }
     }
 }
 
+/** Tapping the app's icon or name looks it up (see [lookUp]); [trailing] holds the row's own buttons. */
 @Composable
-private fun AppRow(
-    app: AppEntry,
-    onClick: (() -> Unit)? = null,
-    note: String? = null,
-    trailing: @Composable () -> Unit,
-) {
+private fun AppRow(app: AppEntry, note: String? = null, trailing: @Composable () -> Unit) {
+    val context = LocalContext.current
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-            .padding(horizontal = 16.dp, vertical = 6.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
     ) {
-        AppIcon(app.packageName)
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(app.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(
-                app.packageName + if (app.isSystem) " · system" else "",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            note?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .weight(1f)
+                .clickable(onClickLabel = "Look up") { lookUp(context, app) }
+                .padding(vertical = 6.dp),
+        ) {
+            AppIcon(app.packageName)
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text(app.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    app.packageName + if (app.isSystem) " · system" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                note?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
+            }
         }
         trailing()
     }
+}
+
+/**
+ * Opens the share sheet with a question about [app], so you can pick a browser to search it, an AI app to
+ * answer it, or anything else that takes text.
+ */
+private fun lookUp(context: Context, app: AppEntry) {
+    val maker = Build.MANUFACTURER.replaceFirstChar { it.titlecase() }
+    val ask = when {
+        !app.isEnabled -> "Is it safe to keep it disabled?"
+        app.canDisable -> "Is it safe to force stop or disable it?"
+        else -> "Is it safe to force stop it?"
+    }
+    val question = "What is the Android app \"${app.label}\" (${app.packageName}) on a $maker phone? $ask"
+    val send = Intent(Intent.ACTION_SEND)
+        .setType("text/plain")
+        .putExtra(Intent.EXTRA_TEXT, question)
+        .putExtra(Intent.EXTRA_TITLE, "Look up ${app.label}") // the share sheet shows this above the text
+    context.startActivity(Intent.createChooser(send, "Look up ${app.label}"))
 }
 
 @Composable
